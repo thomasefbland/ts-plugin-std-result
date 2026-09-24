@@ -51,6 +51,7 @@ function init(modules: { typescript: typeof ts_types }) {
   interface Result_Analysis {
     ok_value_types: ts_types.Type[];
     error_types: ts_types.Type[];
+    is_async: boolean;
   }
 
   interface Unwrapped_Return {
@@ -75,16 +76,30 @@ function init(modules: { typescript: typeof ts_types }) {
     const members = type.isUnion() ? type.types : [type];
     const ok_value_types: ts_types.Type[] = [];
     const error_types: ts_types.Type[] = [];
+    let is_async = false;
 
-    const first_obj = members.find((m) => !!(m.flags & ts.TypeFlags.Object));
-    if (!first_obj) return null;
-    const brand_prop = first_obj.getProperty("~brand");
-    if (!brand_prop) return null;
-    const brand_type = checker.typeToString(checker.getTypeOfSymbol(brand_prop));
-    if (brand_type !== `"${RESULT_BRAND}"`) return null;
+    // Result members carry the "~brand"; Async_Result members are
+    // Promise<Result<...>> and carry it on the type they wrap. Unwrap each
+    // Promise member individually so mixed Sync_Or_Async_Result unions
+    // (Result | Async_Result) classify as Results instead of "other".
+    let first_result_obj: ts_types.Type | null = null;
+    for (const raw_member of members) {
+      if (!(raw_member.flags & ts.TypeFlags.Object)) return null;
 
-    for (const member of members) {
-      if (!(member.flags & ts.TypeFlags.Object)) return null;
+      let member: ts_types.Type = raw_member;
+      const symbol = raw_member.getSymbol?.();
+      if (symbol?.getName() === "Promise") {
+        const type_args = checker.getTypeArguments(raw_member as ts_types.TypeReference);
+        if (type_args?.length !== 1) return null;
+        is_async = true;
+        const inner_analysis = analyze_result_union(checker, type_args[0]);
+        if (!inner_analysis) return null;
+        ok_value_types.push(...inner_analysis.ok_value_types);
+        error_types.push(...inner_analysis.error_types);
+        continue;
+      }
+
+      if (!first_result_obj) first_result_obj = member;
 
       const is_ok_prop = member.getProperty("is_ok");
       const value_prop = member.getProperty("value");
@@ -99,8 +114,17 @@ function init(modules: { typescript: typeof ts_types }) {
       else error_types.push(checker.getTypeOfSymbol(error_prop));
     }
 
+    // Brand is validated on a plain Result member here; when every member was
+    // a Promise, the recursive call above already validated it.
+    if (first_result_obj) {
+      const brand_prop = first_result_obj.getProperty("~brand");
+      if (!brand_prop) return null;
+      const brand_type = checker.typeToString(checker.getTypeOfSymbol(brand_prop));
+      if (brand_type !== `"${RESULT_BRAND}"`) return null;
+    }
+
     if (ok_value_types.length === 0 && error_types.length === 0) return null;
-    return { ok_value_types, error_types };
+    return { ok_value_types, error_types, is_async };
   }
 
   function dedupe_type_strings(checker: ts_types.TypeChecker, types: ts_types.Type[], enclosing_node: ts_types.Node | undefined): string[] {
@@ -154,7 +178,7 @@ function init(modules: { typescript: typeof ts_types }) {
 
     const t_strings = dedupe_type_strings(checker, analyzed.ok_value_types, enclosing_node);
     const e_strings = dedupe_type_strings(checker, analyzed.error_types, enclosing_node);
-    return format_result_type(unwrapped.is_async, t_strings, e_strings);
+    return format_result_type(unwrapped.is_async || analyzed.is_async, t_strings, e_strings);
   }
 
   function compute_result_string_for_type(checker: ts_types.TypeChecker, callable_type: ts_types.Type, enclosing_node: ts_types.Node): string | null {
@@ -183,10 +207,9 @@ function init(modules: { typescript: typeof ts_types }) {
   type Return_Kind = "result" | "async_result" | "other";
 
   function classify_type_kind(checker: ts_types.TypeChecker, type: ts_types.Type): Return_Kind {
-    const unwrapped = unwrap_promise(checker, type);
-    const analyzed = analyze_result_union(checker, unwrapped.inner);
+    const analyzed = analyze_result_union(checker, type);
     if (!analyzed) return "other";
-    return unwrapped.is_async ? "async_result" : "result";
+    return analyzed.is_async ? "async_result" : "result";
   }
 
   function classify_return_type(checker: ts_types.TypeChecker, signature: ts_types.Signature): Return_Kind {
@@ -198,7 +221,11 @@ function init(modules: { typescript: typeof ts_types }) {
     function walk(node: ts_types.Node) {
       if (ts.isReturnStatement(node) && node.expression) {
         results.push({ kind: classify_type_kind(checker, checker.getTypeAtLocation(node.expression)), node });
+        return;
       }
+      // Returns inside nested functions/callbacks belong to those functions,
+      // not to the function being linted — don't descend into them.
+      if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node)) return;
       ts.forEachChild(node, walk);
     }
     walk(body);
@@ -309,7 +336,7 @@ function init(modules: { typescript: typeof ts_types }) {
           if (analyzed) {
             const t_strings = dedupe_type_strings(checker, analyzed.ok_value_types, node);
             const e_strings = dedupe_type_strings(checker, analyzed.error_types, node);
-            merged = format_result_type(unwrapped.is_async, t_strings, e_strings);
+            merged = format_result_type(unwrapped.is_async || analyzed.is_async, t_strings, e_strings);
           }
         }
 
@@ -420,7 +447,7 @@ function init(modules: { typescript: typeof ts_types }) {
 
           const t_strings = dedupe_type_strings(checker, analyzed.ok_value_types, node);
           const e_strings = dedupe_type_strings(checker, analyzed.error_types, node);
-          const merged = format_result_type(unwrapped.is_async, t_strings, e_strings);
+          const merged = format_result_type(unwrapped.is_async || analyzed.is_async, t_strings, e_strings);
           hint.text = merged;
           hint.displayParts = [{ kind: "text", text: merged }];
         }
